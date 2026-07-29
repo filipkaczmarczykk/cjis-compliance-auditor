@@ -3,8 +3,7 @@ import docx  # Library to read .docx files
 import io    # Used for handling file streams in memory
 from fastapi import FastAPI, UploadFile, File, Form # FastAPI framework components
 from fastapi.middleware.cors import CORSMiddleware  # Middleware for handling Cross-Origin Resource Sharing
-from fastapi.responses import HTMLResponse          # Used to send HTML files back to the browser
-import PyPDF2 # Library to read .pdf files
+import pypdf # Library to read .pdf files
 
 # Import the compliance checking logic from the other file
 from compliance_checker import CJISComplianceChecker, ComplianceStatus
@@ -22,16 +21,6 @@ app.add_middleware(
 )
 
 # --- Route Definitions ---
-
-# Route for the main page (serves the HTML frontend)
-@app.get("/")
-async def root():
-    """Serves the main index.html file."""
-    try:
-        with open("index.html", "r", encoding="utf-8") as f:
-            return HTMLResponse(content=f.read())
-    except FileNotFoundError:
-        return HTMLResponse(content="<h1>Error: index.html not found</h1>", status_code=500)
 
 # Route for handling the analysis API requests
 @app.post("/api/analyze")
@@ -53,7 +42,7 @@ async def analyze_policy(
         # Check file extension and extract text accordingly
         if file.filename.endswith('.pdf'):
             try:
-                pdf_reader = PyPDF2.PdfReader(io.BytesIO(content))
+                pdf_reader = pypdf.PdfReader(io.BytesIO(content))
                 # Join text from all pages that actually contain text
                 text = ''.join([page.extract_text() for page in pdf_reader.pages if page.extract_text()])
             except Exception as e:

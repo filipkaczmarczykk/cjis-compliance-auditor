@@ -206,3 +206,7 @@ marimo/_static/
 marimo/_lsp/
 __marimo__/
 data/sources/
+
+# macOS / Claude Code local files
+.DS_Store
+.claude/

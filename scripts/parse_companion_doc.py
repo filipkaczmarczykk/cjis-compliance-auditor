@@ -30,7 +30,28 @@ import pdfplumber
 AUDIT_DATE_RE = re.compile(r"^\d{1,2}/\d{1,2}/\d{4}$")
 KNOWN_AUDIT_STATUSES = {"Existing", "Zero-cycle"}
 KNOWN_PRIORITIES = {"Existing", "P1", "P2", "P3", "P4"}
-KNOWN_RESPONSIBILITIES = {"CJIS/CSO", "Agency", "Service Provider", "Both", "TBD"}
+
+# Responsibility cells are colour-coded. This mapping is the document's own
+# legend on PDF page 2 ("Dark Gray CJIS*/CSO", "Dark Green Agency",
+# "Dark Blue Service Provider", "Orange Both", "Aqua TBD"); values are the
+# legend swatches' RGB fills (0-1). Pure black is not in the legend: those
+# cells show no value in the document, so they are null.
+RESPONSIBILITY_LEGEND = {
+    "CJIS/CSO": (0.502, 0.502, 0.502),
+    "Agency": (0.310, 0.384, 0.157),
+    "Service Provider": (0.000, 0.439, 0.753),
+    "Both": (0.886, 0.420, 0.039),
+    "TBD": (0.573, 0.804, 0.863),
+}
+BLACK = (0.0, 0.0, 0.0)
+# Independent of the colour mapping above: the only values allowed in the output.
+KNOWN_RESPONSIBILITIES = {"CJIS/CSO", "Agency", "Service Provider", "Both", "TBD", None}
+COLOR_TOLERANCE = 0.01
+RESPONSIBILITY_COLUMNS = (6, 7, 8)  # IaaS, PaaS, SaaS
+
+
+class ExtractionError(Exception):
+    """Raised when the PDF disagrees with what the parser expects."""
 
 # --- Garbled-text detection -------------------------------------------------
 # Two independent signals: (1) a low fraction of "real English word" tokens
@@ -139,8 +160,10 @@ def is_skippable_row(row):
         return True
     if len(cells) > 4 and cells[4] == "Sanction Date":
         return True
-    non_empty = [c for c in cells if c]
-    if len(non_empty) <= 1:
+    non_empty = [i for i, c in enumerate(cells) if c]
+    # Banner rows hold text only in the first cell; a row with text anywhere
+    # else (e.g. only a Shall Statement) is a real requirement row.
+    if not non_empty or non_empty == [0]:
         return True
     return False
 
@@ -167,14 +190,69 @@ def parse_priority(raw_value):
     return value
 
 
-def parse_responsibility(raw_value):
-    value = clean_text(raw_value)
-    if not value:
-        return None
-    if value in KNOWN_RESPONSIBILITIES:
+def _rgb(color):
+    """Normalise a pdfplumber fill colour (gray scalar or RGB) to an RGB tuple."""
+    if isinstance(color, (int, float)):
+        return (float(color),) * 3
+    color = tuple(float(c) for c in color)
+    if len(color) == 1:
+        return color * 3
+    if len(color) == 3:
+        return color
+    raise ExtractionError(f"unsupported fill colour {color!r}")
+
+
+def _same_color(a, b):
+    return all(abs(x - y) <= COLOR_TOLERANCE for x, y in zip(a, b))
+
+
+def fill_color_at(rects, bbox):
+    """Fill colour of the smallest filled rectangle containing the cell's centre."""
+    x = (bbox[0] + bbox[2]) / 2
+    y = (bbox[1] + bbox[3]) / 2
+    best = None
+    for rect in rects:
+        if not rect.get("fill") or rect["x1"] - rect["x0"] <= 3 or rect["bottom"] - rect["top"] <= 3:
+            continue
+        if rect["x0"] <= x <= rect["x1"] and rect["top"] <= y <= rect["bottom"]:
+            area = (rect["x1"] - rect["x0"]) * (rect["bottom"] - rect["top"])
+            if best is None or area < best[0]:
+                best = (area, rect["non_stroking_color"])
+    return None if best is None else _rgb(best[1])
+
+
+def resolve_responsibility(rects, bbox, raw_text, where, audit):
+    """
+    Value of one responsibility cell, taken from its fill colour (via the
+    legend) and cross-checked against its text. Returns the value, or None
+    for black-filled cells. Raises ExtractionError if colour and text disagree.
+    """
+    if bbox is None:
+        raise ExtractionError(f"{where}: no cell geometry")
+    color = fill_color_at(rects, bbox)
+    if color is None:
+        raise ExtractionError(f"{where}: responsibility cell has no fill colour")
+    if _same_color(color, BLACK):
+        return None  # hidden text under black fill is ignored
+
+    matches = [v for v, legend in RESPONSIBILITY_LEGEND.items() if _same_color(color, legend)]
+    if not matches:
+        raise ExtractionError(f"{where}: fill colour {color} is not in the legend")
+    value = matches[0]
+
+    text = clean_text(raw_text)
+    if not text:
+        audit["blank_text_cells"].append(where)
         return value
-    print(f"WARNING: unexpected responsibility value: {value!r}", file=sys.stderr)
-    return value
+    if text == value:
+        return value
+    # "Service Provider" wraps onto two lines; when the row is too short the
+    # second line is drawn into the next row, so the text reads "Service" in
+    # one row and "Provider <value>" in the next. Only this shape is tolerated.
+    if (value == "Service Provider" and text == "Service") or text == f"Provider {value}":
+        audit["wrap_exceptions"].append(where)
+        return value
+    raise ExtractionError(f"{where}: text {text!r} disagrees with fill colour (legend value {value!r})")
 
 
 def add_warning(record, warning):
@@ -188,6 +266,7 @@ def add_warning(record, warning):
 def extract_raw_rows(pdf_path, start_page, end_page):
     """Walk the table cells and forward-fill section/title, one dict per table row."""
     raw_rows = []
+    audit = {"blank_text_cells": [], "wrap_exceptions": []}
 
     # Forward-fill state, carried across pages since a section's rows can
     # span a page break (e.g. section 3.2.9 continues from page 5 onto page 6).
@@ -199,13 +278,18 @@ def extract_raw_rows(pdf_path, start_page, end_page):
         last_page = len(pdf.pages) if end_page is None else min(end_page, len(pdf.pages))
         for page_number in range(start_page, last_page + 1):
             page = pdf.pages[page_number - 1]
-            for table in page.extract_tables():
-                for row in table:
+            rects = page.rects
+            for table in page.find_tables():
+                table_rows = table.rows
+                table_data = table.extract()
+                if len(table_rows) != len(table_data):
+                    raise ExtractionError(f"page {page_number}: table row geometry does not match extracted rows")
+                for row_geometry, row in zip(table_rows, table_data):
                     if is_skippable_row(row):
                         continue
 
                     cells = list(row) + [None] * (9 - len(row))
-                    v6_0, v6_1, title, shall, audit, priority, iaas, paas, saas = cells[:9]
+                    v6_0, v6_1, title, shall, audit_cell, priority, iaas, paas, saas = cells[:9]
 
                     v6_0 = clean_text(v6_0)
                     v6_1 = clean_text(v6_1)
@@ -227,7 +311,14 @@ def extract_raw_rows(pdf_path, start_page, end_page):
                     if title and title != '"':
                         current_title = title
 
-                    audit_status, audit_date = parse_audit_sanction(audit)
+                    audit_status, audit_date = parse_audit_sanction(audit_cell)
+
+                    blank_before = len(audit["blank_text_cells"])
+                    responsibilities = []
+                    for column, name, text in zip(RESPONSIBILITY_COLUMNS, ("IaaS", "PaaS", "SaaS"), (iaas, paas, saas)):
+                        where = f"page {page_number}, section {current_section_v6_0!r}, row {shall_text[:50]!r}, {name}"
+                        bbox = row_geometry.cells[column] if column < len(row_geometry.cells) else None
+                        responsibilities.append(resolve_responsibility(rects, bbox, text, where, audit))
 
                     record = {
                         "section_v6_0": current_section_v6_0,
@@ -237,16 +328,18 @@ def extract_raw_rows(pdf_path, start_page, end_page):
                         "audit_sanction_status": audit_status,
                         "audit_sanction_date": audit_date,
                         "priority": parse_priority(priority),
-                        "responsibility_iaas": parse_responsibility(iaas),
-                        "responsibility_paas": parse_responsibility(paas),
-                        "responsibility_saas": parse_responsibility(saas),
+                        "responsibility_iaas": responsibilities[0],
+                        "responsibility_paas": responsibilities[1],
+                        "responsibility_saas": responsibilities[2],
                     }
                     if is_garbled(shall_text):
                         add_warning(record, "garbled_text")
+                    if len(audit["blank_text_cells"]) > blank_before:
+                        add_warning(record, "missing_source_text")
 
                     raw_rows.append((had_explicit_id, record))
 
-    return raw_rows
+    return raw_rows, audit
 
 
 def merge_continuations(raw_rows):
@@ -282,9 +375,44 @@ def merge_continuations(raw_rows):
     return records
 
 
+EXPECTED_WRAP_EXCEPTIONS = 2  # the two AU-3 (1) cells on PDF page 18
+EXPECTED_BLANK_TEXT_ROWS = 2  # AT-3 "Organizational Personnel..." and SI-2 "e. SI-2 Flaw Remediation"
+
+
+def check_full_run_expectations(audit):
+    """Stop if the tolerated oddities occur anywhere other than where they were audited."""
+    wraps = audit["wrap_exceptions"]
+    if len(wraps) != EXPECTED_WRAP_EXCEPTIONS or any("section 'AU-3 (1)'" not in w for w in wraps):
+        raise ExtractionError("Service Provider wrap exception used %d times (expected %d, all in AU-3 (1)):\n  %s"
+                              % (len(wraps), EXPECTED_WRAP_EXCEPTIONS, "\n  ".join(wraps)))
+    blank_rows = sorted({w.rsplit(", ", 1)[0] for w in audit["blank_text_cells"]})
+    if len(blank_rows) != EXPECTED_BLANK_TEXT_ROWS:
+        raise ExtractionError("blank text on coloured cells in %d rows (expected %d):\n  %s"
+                              % (len(blank_rows), EXPECTED_BLANK_TEXT_ROWS, "\n  ".join(blank_rows)))
+
+
+def validate_responsibility_values(records):
+    """Final guard: every responsibility value must be a known enum value or null."""
+    for index, record in enumerate(records):
+        for field in ("responsibility_iaas", "responsibility_paas", "responsibility_saas"):
+            if record.get(field) not in KNOWN_RESPONSIBILITIES:
+                raise ExtractionError(
+                    f"output row {index} ({record['section_v6_0']!r}, {record['shall_text'][:50]!r}): "
+                    f"{field}={record.get(field)!r} is not a known responsibility value"
+                )
+
+
 def parse_pages(pdf_path, start_page, end_page):
-    raw_rows = extract_raw_rows(pdf_path, start_page, end_page)
-    return merge_continuations(raw_rows)
+    raw_rows, audit = extract_raw_rows(pdf_path, start_page, end_page)
+    for where in audit["wrap_exceptions"]:
+        print(f"NOTE: Service Provider wrap exception used: {where}", file=sys.stderr)
+    for where in audit["blank_text_cells"]:
+        print(f"NOTE: blank text on coloured cell, value taken from colour: {where}", file=sys.stderr)
+    if start_page <= 4 and end_page is None:
+        check_full_run_expectations(audit)
+    records = merge_continuations(raw_rows)
+    validate_responsibility_values(records)
+    return records
 
 
 def main():
@@ -313,7 +441,16 @@ def main():
     )
     args = parser.parse_args()
 
-    records = parse_pages(Path(args.input), args.start_page, args.end_page)
+    try:
+        records = parse_pages(Path(args.input), args.start_page, args.end_page)
+    except ExtractionError as error:
+        sys.exit(f"ERROR: {error}")
+
+    tbd_rows = [r for r in records if "TBD" in (r["responsibility_iaas"], r["responsibility_paas"], r["responsibility_saas"])]
+    if tbd_rows:
+        # The v6.1 audit found no TBD cells; review before writing anything.
+        listing = "\n  ".join(f"{r['section_v6_0']}: {r['shall_text'][:70]}" for r in tbd_rows)
+        sys.exit(f"ERROR: {len(tbd_rows)} rows contain TBD (audit found 0); not writing output:\n  {listing}")
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
